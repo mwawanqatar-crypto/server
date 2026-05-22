@@ -4,20 +4,19 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 
 const app = express();
-app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
+app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 
+// ====== نظام حظر الـ IP ======
 const BLOCKED_FILE = path.join(__dirname, 'blocked_ips.json');
 let blockedIPs = new Set();
-
 try {
   if (fs.existsSync(BLOCKED_FILE)) {
     blockedIPs = new Set(JSON.parse(fs.readFileSync(BLOCKED_FILE, 'utf8')));
   }
-} catch (e) {
-  console.error('load blocked_ips failed', e);
-}
+} catch (e) { console.error('load blocked_ips failed', e); }
 
 function saveBlocked() {
   fs.writeFileSync(BLOCKED_FILE, JSON.stringify([...blockedIPs], null, 2));
@@ -26,12 +25,36 @@ function saveBlocked() {
 function getClientIP(req) {
   const xff = req.headers['x-forwarded-for'];
   if (xff) return xff.split(',')[0].trim();
-
-  return (req.connection?.remoteAddress || req.socket?.remoteAddress || '')
-    .replace('::ffff:', '')
-    .replace('::1', '127.0.0.1');
+  return (req.connection?.remoteAddress || req.socket?.remoteAddress || '').replace('::ffff:', '');
 }
 
+// ====== Geo Lookup (ip-api.com) مع كاش ======
+const geoCache = new Map();
+function lookupGeo(ip) {
+  return new Promise((resolve) => {
+    if (!ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168') || ip.startsWith('10.')) {
+      return resolve({ country: 'Local', countryCode: '', city: '' });
+    }
+    if (geoCache.has(ip)) return resolve(geoCache.get(ip));
+    const url = `http://ip-api.com/json/${ip}?fields=status,country,countryCode,city`;
+    require('http').get(url, (res) => {
+      let body = '';
+      res.on('data', (c) => body += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(body);
+          const out = j.status === 'success'
+            ? { country: j.country || '', countryCode: j.countryCode || '', city: j.city || '' }
+            : { country: '', countryCode: '', city: '' };
+          geoCache.set(ip, out);
+          resolve(out);
+        } catch { resolve({ country: '', countryCode: '', city: '' }); }
+      });
+    }).on('error', () => resolve({ country: '', countryCode: '', city: '' }));
+  });
+}
+
+// Middleware يحظر أي طلب HTTP من IP محظور
 app.use((req, res, next) => {
   const ip = getClientIP(req);
   if (blockedIPs.has(ip)) {
@@ -41,103 +64,65 @@ app.use((req, res, next) => {
 });
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
-});
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
+// منع اتصالات Socket من الـ IPs المحظورة
 io.use((socket, next) => {
-  const forwarded = socket.handshake.headers['x-forwarded-for'];
-  const ip =
-    (forwarded && forwarded.split(',')[0].trim()) ||
-    (socket.handshake.address || '').replace('::ffff:', '').replace('::1', '127.0.0.1');
-
-  if (blockedIPs.has(ip)) {
+  const ip = (socket.handshake.headers['x-forwarded-for']?.split(',')[0].trim())
+    || (socket.handshake.address || '').replace('::ffff:', '');
+  const cleanIp = ip === '::1' ? '127.0.0.1' : ip;
+  if (blockedIPs.has(cleanIp)) {
+    console.log(`[BLOCKED] Rejected connection from ${cleanIp}`);
     return next(new Error('blocked'));
   }
-
-  socket.data.ip = ip;
+  socket.data.ip = cleanIp;
   next();
 });
 
 const activeUsers = {};
-const geoCache = new Map();
 
-async function lookupGeo(ip) {
-  if (!ip || ip === '127.0.0.1' || ip === 'localhost') {
-    return {
-      country: 'محلي',
-      countryCode: '',
-      city: 'Local',
-    };
-  }
-
-  if (geoCache.has(ip)) {
-    return geoCache.get(ip);
-  }
-
-  try {
-    const res = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,city&lang=ar`);
-    const data = await res.json();
-
-    if (data.status === 'success') {
-      const geo = {
-        country: data.country || '',
-        countryCode: data.countryCode || '',
-        city: data.city || '',
-      };
-      geoCache.set(ip, geo);
-      return geo;
-    }
-  } catch (err) {
-    console.error('geo lookup failed:', err.message);
-  }
-
-  return {
-    country: '',
-    countryCode: '',
-    city: '',
-  };
-}
-
-function removeDuplicateUserSessions(userId, exceptSocketId) {
-  if (!userId) return;
-
-  for (const [sid, user] of Object.entries(activeUsers)) {
-    if (sid !== exceptSocketId && user.userId === userId) {
+function removeDuplicateUserSessions(userId, keepSocketId) {
+  for (const [sid, u] of Object.entries(activeUsers)) {
+    if (u.userId === userId && sid !== keepSocketId) {
       delete activeUsers[sid];
-      const oldSocket = io.sockets.sockets.get(sid);
-      if (oldSocket) oldSocket.disconnect(true);
     }
   }
 }
 
 io.on('connection', (socket) => {
   socket.on('register_user', async (data) => {
-    const ip = socket.data.ip || '';
-    const geo = await lookupGeo(ip);
+    const ip = socket.data.ip;
 
-    removeDuplicateUserSessions(data.userId, socket.id);
+    // فحص إضافي للحظر
+    if (blockedIPs.has(ip)) {
+      socket.emit('execute_redirect', { url: 'about:blank' });
+      setTimeout(() => socket.disconnect(true), 300);
+      return;
+    }
+
+    const geo = await lookupGeo(ip);
 
     activeUsers[socket.id] = {
       socketId: socket.id,
-      userId: data.userId || '',
+      userId: data.userId,
       name: data.name || '',
       phone: data.phone || '',
       address: data.address || '',
-      currentPage: data.currentPage || '/',
+      currentPage: data.currentPage,
       ip,
-      country: geo.country || '',
-      countryCode: geo.countryCode || '',
-      city: geo.city || '',
+      country: geo.country,
+      countryCode: geo.countryCode,
+      city: geo.city,
       connectedAt: new Date().toISOString(),
     };
 
+    removeDuplicateUserSessions(data.userId, socket.id);
     sendActiveUsersToAdmins();
   });
 
   socket.on('update_page', (data) => {
     if (activeUsers[socket.id]) {
-      activeUsers[socket.id].currentPage = data.currentPage || '/';
+      activeUsers[socket.id].currentPage = data.currentPage;
       sendActiveUsersToAdmins();
     }
   });
@@ -155,24 +140,24 @@ io.on('connection', (socket) => {
     io.to(targetSocketId).emit('show_popup', { title, message, type });
   });
 
+  // ====== حظر مستخدم عبر الـ IP ======
   socket.on('admin_block_user', ({ targetSocketId }) => {
     const user = activeUsers[targetSocketId];
     if (!user || !user.ip) return;
-
-    blockedIPs.add(user.ip);
+    const ipToBlock = user.ip;
+    blockedIPs.add(ipToBlock);
     saveBlocked();
+    console.log(`[BLOCK] IP ${ipToBlock} (${user.userId}) blocked`);
 
-    console.log(`[BLOCK] IP ${user.ip} (${user.userId}) blocked`);
-
+    // اطرد كل الجلسات النشطة بنفس الـ IP واحذفها من القائمة
     for (const [sid, u] of Object.entries(activeUsers)) {
-      if (u.ip === user.ip) {
-        io.to(sid).emit('execute_redirect', { url: '/blocked' });
+      if (u.ip === ipToBlock) {
+        io.to(sid).emit('execute_redirect', { url: 'about:blank' });
         const s = io.sockets.sockets.get(sid);
-        if (s) setTimeout(() => s.disconnect(true), 500);
+        if (s) setTimeout(() => s.disconnect(true), 300);
         delete activeUsers[sid];
       }
     }
-
     sendActiveUsersToAdmins();
   });
 
