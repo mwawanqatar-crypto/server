@@ -7,9 +7,11 @@ const path = require('path');
 
 const app = express();
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
+app.use(express.json());
 
 const BLOCKED_FILE = path.join(__dirname, 'blocked_ips.json');
 let blockedIPs = new Set();
+
 try {
   if (fs.existsSync(BLOCKED_FILE)) {
     blockedIPs = new Set(JSON.parse(fs.readFileSync(BLOCKED_FILE, 'utf8')));
@@ -26,6 +28,20 @@ function getClientIP(req) {
   return (req.connection?.remoteAddress || req.socket?.remoteAddress || '').replace('::ffff:', '');
 }
 
+// ====== Health check ======
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'Server is running' });
+});
+
+// ====== NEW: /check-block endpoint ======
+// بيرجع للموقع هل الـ IP تاع الزائر محظور أو لا
+app.get('/check-block', (req, res) => {
+  const ip = getClientIP(req);
+  const blocked = blockedIPs.has(ip);
+  res.json({ blocked, ip });
+});
+
+// ====== Middleware للحظر (بعد /check-block عشان يقدر يوصل) ======
 app.use((req, res, next) => {
   const ip = getClientIP(req);
   if (blockedIPs.has(ip)) {
@@ -47,7 +63,6 @@ io.use((socket, next) => {
 
 // ====== كاش الموقع الجغرافي لكل IP ======
 const geoCache = new Map();
-
 async function lookupGeo(ip) {
   if (!ip || ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.')) {
     return { country: 'محلي', countryCode: '', city: '' };
@@ -70,17 +85,13 @@ async function lookupGeo(ip) {
 const activeUsers = {};
 
 io.on('connection', (socket) => {
-
   socket.on('register_user', async (data) => {
-    // إزالة أي جلسة سابقة لنفس المستخدم
     for (const sid in activeUsers) {
       if (activeUsers[sid].userId === data.userId) {
         delete activeUsers[sid];
       }
     }
-
     const geo = await lookupGeo(socket.data.ip);
-
     activeUsers[socket.id] = {
       socketId: socket.id,
       userId: data.userId,
@@ -123,7 +134,6 @@ io.on('connection', (socket) => {
     blockedIPs.add(user.ip);
     saveBlocked();
     console.log(`[BLOCK] IP ${user.ip} (${user.userId}) blocked`);
-
     for (const [sid, u] of Object.entries(activeUsers)) {
       if (u.ip === user.ip) {
         io.to(sid).emit('execute_redirect', { url: '/blocked' });
